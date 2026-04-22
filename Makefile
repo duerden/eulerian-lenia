@@ -3,9 +3,9 @@
 
 SRC = lenia.cpp
 OUT = lenia.js
-EXPORTED = _clear_growth,_apply_rule,_apply_growth,_apply_growth_conserved,_fft_prepare_kernel,_fft_apply_rule,_is_power_of_2,_draw,_alloc_f64,_alloc_u8,_free_f64,_free_u8
+EXPORTED = _clear_growth,_apply_rule,_apply_growth,_apply_growth_conserved,_fft_prepare_kernel,_fft_forward_layer,_fft_apply_rule,_is_power_of_2,_draw,_alloc_f64,_alloc_u8,_free_f64,_free_u8
 
-CFLAGS = -O2 \
+CFLAGS = -O3 -msimd128 \
 	-s WASM=1 \
 	-s EXPORTED_FUNCTIONS='[$(EXPORTED)]' \
 	-s EXPORTED_RUNTIME_METHODS='["ccall","cwrap","HEAPF64","HEAPU8"]' \

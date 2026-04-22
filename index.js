@@ -7,7 +7,6 @@ class Lenia {
 	ctx;
 
 	world = null; //world!=null represents ready state
-	next_world = null;
 	n_steps = 0;
 
 	world_width = 256;
@@ -46,20 +45,18 @@ class Lenia {
 	wasm_world_ptr = null;
 	wasm_next_world_ptr = null;
 	wasm_growth_ptr = null;
-	wasm_kernel_ptrs = [];     // spatial kernels, one per rule
-	wasm_kernel_fft_ptrs = []; // FFT'd kernels, one per rule (null if spatial fallback)
-	wasm_fft_temp_ptr = null;  // scratch buffer for FFT convolution
+	wasm_kernel_ptrs = [];       // spatial kernels, one per rule
+	wasm_kernel_fft_ptrs = [];   // FFT'd kernels, one per rule
+	wasm_fft_temp_ptr = null;    // scratch buffer for FFT convolution (2*W*H)
+	wasm_fft_col_buf_ptr = null; // scratch for fft2d column pass (2*max(W,H))
+	wasm_layer_fft_ptrs = [];    // cached FFT of each source layer (one per layer, 2*W*H each)
 	wasm_rgba_ptr = null;
-	wasm_use_fft = false;      // true if world dims are power-of-2
+	wasm_use_fft = false;        // true if world dims are power-of-2
+	wasm_js_dirty = true;        // true when JS world[] is stale vs WASM
 
 	running_raf = null;
 
-	constructor(selector, tryWASM = true) {
-		if(tryWASM){
-			this.init_wasm();
-		}
-
-		this.tryWASM = tryWASM;
+	constructor(selector) {
 		this.canvas = document.querySelectorAll(selector)[0];
 		console.log("canvas", this.canvas)
 		this.setup_canvas();
@@ -71,6 +68,8 @@ class Lenia {
 		this.setup_world();
 
 		this.setup_gui();
+
+		this.init_wasm();
 	}
 
 	is_ready() {return this.world != null}
@@ -92,6 +91,9 @@ class Lenia {
 			this._wasm_upload_kernels();
 
 			console.log("WASM buffers allocated and synced")
+
+			// Initial draw now that WASM is ready
+			this.draw();
 		} catch(e) {
 			console.error("Failed to init WASM, using JS fallback", e)
 			this.wasm = null;
@@ -113,9 +115,22 @@ class Lenia {
 		if (this.wasm_use_fft) {
 			// Scratch buffer for FFT convolution: interleaved complex, 2 * W * H doubles
 			this.wasm_fft_temp_ptr = this.wasm._alloc_f64(2 * W * H);
-			console.log(`FFT convolution enabled (${W}x${H})`);
+
+			// Column scratch buffer for fft2d: 2 * max(W, H) doubles
+			const max_dim = W > H ? W : H;
+			this.wasm_fft_col_buf_ptr = this.wasm._alloc_f64(2 * max_dim);
+
+			// Per-layer FFT cache buffers (one per layer, 2*W*H each)
+			this.wasm_layer_fft_ptrs = [];
+			for (let i = 0; i < L; i++) {
+				this.wasm_layer_fft_ptrs.push(this.wasm._alloc_f64(2 * W * H));
+			}
+
+			console.log(`FFT convolution enabled (${W}x${H}, ${L} layers)`);
 		} else {
 			this.wasm_fft_temp_ptr = null;
+			this.wasm_fft_col_buf_ptr = null;
+			this.wasm_layer_fft_ptrs = [];
 			console.log(`Spatial convolution (${W}x${H} is not power-of-2)`);
 		}
 	}
@@ -139,7 +154,6 @@ class Lenia {
 		this.wasm_kernel_ptrs = [];
 		this.wasm_kernel_fft_ptrs = [];
 
-		// Upload each rule's kernel (spatial form always needed for fallback)
 		for (const rule of this.rules) {
 			const kernel = rule.kernel;
 			const count = kernel.size * kernel.size;
@@ -157,20 +171,22 @@ class Lenia {
 			// Prepare FFT'd kernel if FFT is enabled
 			if (this.wasm_use_fft) {
 				const fft_ptr = this.wasm._alloc_f64(2 * W * H);
-				this.wasm._fft_prepare_kernel(ptr, kernel.size, fft_ptr, W, H);
+				this.wasm._fft_prepare_kernel(ptr, kernel.size, fft_ptr, W, H, this.wasm_fft_col_buf_ptr);
 				this.wasm_kernel_fft_ptrs.push(fft_ptr);
 			}
 		}
 	}
 
 	_wasm_download_world() {
-		// Copy WASM world state back to JS (after step swaps into world_ptr)
+		// Copy WASM world state back to JS only when actually needed
+		if (!this.wasm_js_dirty) return;
 		const f64view = new Float64Array(
 			this.wasm.HEAPF64.buffer,
 			this.wasm_world_ptr,
 			this.world_width * this.world_height * this.layers
 		);
 		this.world.set(f64view);
+		this.wasm_js_dirty = false;
 	}
 
 	_wasm_free_buffers() {
@@ -179,11 +195,15 @@ class Lenia {
 		if (this.wasm_next_world_ptr) this.wasm._free_f64(this.wasm_next_world_ptr);
 		if (this.wasm_growth_ptr) this.wasm._free_f64(this.wasm_growth_ptr);
 		if (this.wasm_fft_temp_ptr) this.wasm._free_f64(this.wasm_fft_temp_ptr);
+		if (this.wasm_fft_col_buf_ptr) this.wasm._free_f64(this.wasm_fft_col_buf_ptr);
+		for (const ptr of this.wasm_layer_fft_ptrs) this.wasm._free_f64(ptr);
 		for (const ptr of this.wasm_kernel_ptrs) this.wasm._free_f64(ptr);
 		for (const ptr of this.wasm_kernel_fft_ptrs) this.wasm._free_f64(ptr);
 		this.wasm_kernel_ptrs = [];
 		this.wasm_kernel_fft_ptrs = [];
+		this.wasm_layer_fft_ptrs = [];
 		this.wasm_fft_temp_ptr = null;
+		this.wasm_fft_col_buf_ptr = null;
 		if (this.wasm_rgba_ptr) this.wasm._free_u8(this.wasm_rgba_ptr);
 	}
 
@@ -228,11 +248,14 @@ class Lenia {
 			const wx = Math.floor(e.offsetX / this.canvas_width * this.world_width);
 			const wy = Math.floor(e.offsetY / this.canvas_height * this.world_height);
 
+			// Ensure JS world is up to date before mutating
+			if (this.wasm) this._wasm_download_world();
+
 			for (let n = 0; n < this.layers; n++) {
 				this.world.seed_blob(wx, wy, 25, n);
 			}
 
-			// Sync to WASM if active
+			// Sync to WASM
 			if (this.wasm) this._wasm_upload_world();
 
 			this.draw();
@@ -245,6 +268,9 @@ class Lenia {
 
 			const wx = Math.floor(e.offsetX / this.canvas_width * this.world_width);
 			const wy = Math.floor(e.offsetY / this.canvas_height * this.world_height);
+
+			// Ensure JS world is up to date before mutating
+			if (this.wasm) this._wasm_download_world();
 
 			for (let n = 0; n < this.layers; n++) {
 				this.world.erase_blob(wx, wy, 25, n);
@@ -806,6 +832,106 @@ class Lenia {
 					  source: 0, dest: 0, mu: 0.40, sigma: 0.08, weight: 1.0 },
 				]
 			},
+
+			// ===================================================================
+			// LENIA4 WebGL SPECIES (Chan's multi-channel demo)
+			// Translated from https://chakazul.github.io/Lenia/WebGL/
+			// Uses Multi-Ring kernels to match the beta0/beta1/beta2 system.
+			// R=12 -> kernel size 25, T=2 -> run at speed ~1
+			// ===================================================================
+
+			'Lenia4: Tri-Color Ghosts': {
+				width: 256, height: 256, layers: 1,
+				rules: [
+					// Channel 0 self-interactions (3 rules)
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 25, rings: 2, betas: [0.25, 1] },
+					  source: 0, dest: 0, mu: 0.16, sigma: 0.025, weight: 0.2 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 25, rings: 3, betas: [1, 0.75, 0.75] },
+					  source: 0, dest: 0, mu: 0.22, sigma: 0.042, weight: 0.2 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 25, rings: 1, betas: [1] },
+					  source: 0, dest: 0, mu: 0.28, sigma: 0.025, weight: 0.2 },
+				]
+			},
+
+			'Lenia4: Tessellatium Fission': {
+				width: 256, height: 256, layers: 3,
+				rules: [
+					// Adapted from VT049W (case 0) - first 9 self-interaction rules
+					// src/dst: 0->0, 0->0, 0->0, 1->1, 1->1, 1->1, 2->2, 2->2, 2->2
+					// Kernel sizes scaled by relR: 0.91, 0.62, 0.5, 0.72, 0.8, 0.96, 0.78, 0.79, 0.5
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 23, rings: 1, betas: [1] },
+					  source: 0, dest: 0, mu: 0.272, sigma: 0.0595, weight: 0.19 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 17, rings: 1, betas: [1] },
+					  source: 0, dest: 0, mu: 0.349, sigma: 0.1585, weight: 0.66 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 13, rings: 2, betas: [1, 0.25] },
+					  source: 0, dest: 0, mu: 0.2, sigma: 0.0332, weight: 0.39 },
+					// Channel 1 self
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 19, rings: 1, betas: [1] },
+					  source: 1, dest: 1, mu: 0.447, sigma: 0.0777, weight: 0.74 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 21, rings: 2, betas: [5/6, 1] },
+					  source: 1, dest: 1, mu: 0.247, sigma: 0.0342, weight: 0.92 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 25, rings: 1, betas: [1] },
+					  source: 1, dest: 1, mu: 0.21, sigma: 0.0617, weight: 0.59 },
+					// Channel 2 self
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 15, rings: 1, betas: [1] },
+					  source: 2, dest: 2, mu: 0.462, sigma: 0.1192, weight: 0.37 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 21, rings: 1, betas: [1] },
+					  source: 2, dest: 2, mu: 0.446, sigma: 0.1793, weight: 0.94 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 21, rings: 2, betas: [11/12, 1] },
+					  source: 2, dest: 2, mu: 0.327, sigma: 0.1408, weight: 0.51 },
+					// Cross-channel interactions (6 rules)
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 13, rings: 2, betas: [3/4, 1] },
+					  source: 0, dest: 1, mu: 0.476, sigma: 0.0995, weight: 0.77 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 19, rings: 2, betas: [11/12, 1] },
+					  source: 0, dest: 2, mu: 0.379, sigma: 0.0697, weight: 0.92 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 17, rings: 1, betas: [1] },
+					  source: 1, dest: 0, mu: 0.262, sigma: 0.0877, weight: 0.71 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 15, rings: 2, betas: [1/6, 1] },
+					  source: 1, dest: 2, mu: 0.412, sigma: 0.1101, weight: 0.59 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 21, rings: 1, betas: [1] },
+					  source: 2, dest: 0, mu: 0.201, sigma: 0.0786, weight: 0.41 },
+				]
+			},
+
+			'Lenia4: Zigzagging': {
+				width: 256, height: 256, layers: 3,
+				rules: [
+					// Adapted from HAESRE (case 6)
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 23, rings: 1, betas: [1] },
+					  source: 0, dest: 0, mu: 0.272, sigma: 0.0674, weight: 0.15 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 17, rings: 1, betas: [1] },
+					  source: 0, dest: 0, mu: 0.337, sigma: 0.1576, weight: 0.474 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 17, rings: 2, betas: [1, 0.25] },
+					  source: 0, dest: 0, mu: 0.129, sigma: 0.0382, weight: 0.342 },
+					// Channel 1 self
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 25, rings: 2, betas: [0, 1] },
+					  source: 1, dest: 1, mu: 0.132, sigma: 0.0514, weight: 0.192 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 19, rings: 1, betas: [1] },
+					  source: 1, dest: 1, mu: 0.429, sigma: 0.0813, weight: 0.524 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 21, rings: 2, betas: [3/4, 1] },
+					  source: 1, dest: 1, mu: 0.239, sigma: 0.0409, weight: 0.598 },
+					// Channel 2 self
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 25, rings: 1, betas: [1] },
+					  source: 2, dest: 2, mu: 0.25, sigma: 0.0691, weight: 0.426 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 19, rings: 1, betas: [1] },
+					  source: 2, dest: 2, mu: 0.497, sigma: 0.1166, weight: 0.348 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 25, rings: 1, betas: [1] },
+					  source: 2, dest: 2, mu: 0.486, sigma: 0.1751, weight: 0.62 },
+					// Cross-channel
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 17, rings: 2, betas: [11/12, 1] },
+					  source: 0, dest: 1, mu: 0.276, sigma: 0.1344, weight: 0.338 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 19, rings: 2, betas: [5/6, 1] },
+					  source: 0, dest: 2, mu: 0.425, sigma: 0.1026, weight: 0.314 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 15, rings: 2, betas: [1, 11/12] },
+					  source: 1, dest: 0, mu: 0.352, sigma: 0.0797, weight: 0.608 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 23, rings: 1, betas: [1] },
+					  source: 1, dest: 2, mu: 0.21, sigma: 0.0921, weight: 0.292 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 21, rings: 2, betas: [1/4, 1] },
+					  source: 2, dest: 0, mu: 0.381, sigma: 0.1056, weight: 0.426 },
+					{ kernel_type: 'Multi-Ring', kernel_params: { size: 19, rings: 1, betas: [1] },
+					  source: 2, dest: 1, mu: 0.244, sigma: 0.0813, weight: 0.346 },
+				]
+			},
 		};
 	}
 
@@ -888,6 +1014,47 @@ class Lenia {
 			k_folder.add(k_params, 'hi', 0, 1, 0.01).name('Hi').onChange(() => {
 				this._rebuild_kernel(rule, k_params);
 			});
+		} else if (kernel instanceof CrossKernel) {
+			k_params.armWidth = kernel.armWidth;
+			k_params.beta = kernel.beta;
+			k_folder.add(k_params, 'armWidth', 0.01, 0.5, 0.01).name('Arm Width').onChange(() => {
+				this._rebuild_kernel(rule, k_params);
+			});
+			k_folder.add(k_params, 'beta', 0.5, 20, 0.5).name('Beta').onChange(() => {
+				this._rebuild_kernel(rule, k_params);
+			});
+		} else if (kernel instanceof SpiralKernel) {
+			k_params.arms = kernel.arms;
+			k_params.tightness = kernel.tightness;
+			k_params.armWidth = kernel.armWidth;
+			k_folder.add(k_params, 'arms', 1, 6, 1).name('Arms').onChange(() => {
+				this._rebuild_kernel(rule, k_params);
+			});
+			k_folder.add(k_params, 'tightness', 0.5, 10, 0.25).name('Tightness').onChange(() => {
+				this._rebuild_kernel(rule, k_params);
+			});
+			k_folder.add(k_params, 'armWidth', 0.1, 2, 0.05).name('Arm Width').onChange(() => {
+				this._rebuild_kernel(rule, k_params);
+			});
+		} else if (kernel instanceof MultiRingKernel) {
+			k_params.rings = kernel.rings;
+			k_params.betas = [...kernel.betas];
+			// Ensure betas array has 3 slots for GUI
+			while (k_params.betas.length < 3) k_params.betas.push(0);
+
+			k_folder.add(k_params, 'rings', 1, 3, 1).name('Rings').onChange(() => {
+				k_params.rings = Math.round(k_params.rings);
+				this._rebuild_kernel(rule, k_params);
+			});
+
+			const beta_proxy = { beta0: k_params.betas[0], beta1: k_params.betas[1], beta2: k_params.betas[2] };
+			const _update_betas = () => {
+				k_params.betas = [beta_proxy.beta0, beta_proxy.beta1, beta_proxy.beta2];
+				this._rebuild_kernel(rule, k_params);
+			};
+			k_folder.add(beta_proxy, 'beta0', 0, 1, 1/12).name('Ring 0 Height').onChange(_update_betas);
+			k_folder.add(beta_proxy, 'beta1', 0, 1, 1/12).name('Ring 1 Height').onChange(_update_betas);
+			k_folder.add(beta_proxy, 'beta2', 0, 1, 1/12).name('Ring 2 Height').onChange(_update_betas);
 		}
 		k_folder.close();
 
@@ -936,6 +1103,10 @@ class Lenia {
 		if (kernel instanceof ExpKernel) return 'Exponential';
 		if (kernel instanceof PolyKernel) return 'Polynomial';
 		if (kernel instanceof RectKernel) return 'Rectangular';
+		if (kernel instanceof SquareKernel) return 'Square';
+		if (kernel instanceof CrossKernel) return 'Cross';
+		if (kernel instanceof SpiralKernel) return 'Spiral';
+		if (kernel instanceof MultiRingKernel) return 'Multi-Ring';
 		return 'Unknown';
 	}
 
@@ -1075,28 +1246,22 @@ class Lenia {
 
 	setup_world(){
 		this.world = new WorldMatrix3D(this.world_width, this.world_height, this.layers)
-		this.next_world = new WorldMatrix3D(this.world_width, this.world_height, this.layers)
 
 		// Scatter random noise squares across each layer
 		for (let n = 0; n < this.layers; n++) {
 			this.world.seed_random_squares(12, 10, 25, n);
 		}
-		//this.world.seed_solid_blob( parseInt(this.world_width/2), parseInt(this.world_height/2), 69)
 
 		this.draw()
 	}
 
 	step(t){
+		if (!this.wasm) return 0;
 		const t0 = performance.now();
 
 		this.n_steps = this.n_steps + 1;
 
-		if (this.wasm) {
-			this._step_wasm(t);
-		} else {
-			this._step_js(t);
-		}
-
+		this._step_wasm(t);
 		this.draw()
 
 		const elapsed_ms = performance.now() - t0;
@@ -1104,37 +1269,57 @@ class Lenia {
 	}
 
 	_step_wasm(t) {
-		const world_count = this.world_width * this.world_height * this.layers;
+		const W = this.world_width, H = this.world_height;
+		const world_count = W * H * this.layers;
 
 		// 1. Clear growth accumulator
 		this.wasm._clear_growth(this.wasm_growth_ptr, world_count);
 
-		// 2. Apply each rule (accumulates into growth buffer)
-		for (let i = 0; i < this.rules.length; i++) {
-			const rule = this.rules[i];
+		// 2. Apply each rule
+		if (this.wasm_use_fft) {
+			// --- FFT path with cached source layer transforms ---
 
-			if (this.wasm_use_fft) {
-				// FFT convolution path
+			// Track which source layers have been FFT'd this step
+			const fft_done = new Uint8Array(this.layers); // 0 = not yet
+
+			for (let i = 0; i < this.rules.length; i++) {
+				const rule = this.rules[i];
+				const src = rule.source;
+
+				// Forward-FFT the source layer if not already cached
+				if (!fft_done[src]) {
+					this.wasm._fft_forward_layer(
+						this.wasm_world_ptr,
+						src,
+						this.wasm_layer_fft_ptrs[src],
+						W, H,
+						this.wasm_fft_col_buf_ptr
+					);
+					fft_done[src] = 1;
+				}
+
+				// Apply rule using cached source FFT
 				this.wasm._fft_apply_rule(
-					this.wasm_world_ptr,
+					this.wasm_layer_fft_ptrs[src],
 					this.wasm_growth_ptr,
-					this.world_width,
-					this.world_height,
-					rule.source,
+					W, H,
 					rule.dest,
 					this.wasm_kernel_fft_ptrs[i],
 					this.wasm_fft_temp_ptr,
+					this.wasm_fft_col_buf_ptr,
 					rule.mu,
 					rule.sigma,
 					rule.weight
 				);
-			} else {
-				// Spatial convolution fallback
+			}
+		} else {
+			// --- Spatial convolution fallback (non-power-of-2) ---
+			for (let i = 0; i < this.rules.length; i++) {
+				const rule = this.rules[i];
 				this.wasm._apply_rule(
 					this.wasm_world_ptr,
 					this.wasm_growth_ptr,
-					this.world_width,
-					this.world_height,
+					W, H,
 					rule.source,
 					rule.dest,
 					this.wasm_kernel_ptrs[i],
@@ -1165,112 +1350,20 @@ class Lenia {
 			);
 		}
 
-		// 5. Swap: copy next_world into world on the WASM side
-		const src = new Float64Array(
-			this.wasm.HEAPF64.buffer,
-			this.wasm_next_world_ptr,
-			world_count
-		);
-		const dst = new Float64Array(
-			this.wasm.HEAPF64.buffer,
-			this.wasm_world_ptr,
-			world_count
-		);
-		dst.set(src);
+		// 4. Swap pointers (no memcpy!)
+		const tmp = this.wasm_world_ptr;
+		this.wasm_world_ptr = this.wasm_next_world_ptr;
+		this.wasm_next_world_ptr = tmp;
 
-		// Keep JS world in sync (for seeding, inspection, etc.)
-		this._wasm_download_world();
+		// Mark JS-side world as stale (download lazily on demand)
+		this.wasm_js_dirty = true;
 	}
 
-	_step_js(t) {
-		const W = this.world.size_x;
-		const H = this.world.size_y;
 
-		// Copy current state into next_world as baseline
-		this.next_world.set(this.world);
-
-		// Accumulate growth contributions from all rules
-		// We need a separate accumulator so multiple rules targeting
-		// the same dest layer sum their growth before applying
-		const growth_acc = new Float64Array(W * H * this.layers);
-
-		for (const rule of this.rules) {
-			const src_offset = this.world.get_layer_offset(rule.source);
-			const dst_offset = rule.dest * W * H;
-			const kernel = rule.kernel;
-			const khalf = kernel.half;
-
-			for (let x = 0; x < W; x++) {
-				for (let y = 0; y < H; y++) {
-					// Convolve kernel with source layer
-					let sum = 0;
-					kernel.iter_elements((dx, dy) => {
-						const nx = (x + dx - khalf + W) % W;
-						const ny = (y + dy - khalf + H) % H;
-						const ki = dx * kernel.size + dy;
-						sum += this.world[src_offset + nx * H + ny] * kernel[ki];
-					})
-
-					// Growth function with this rule's params, weighted
-					const g = rule.growth(sum) * rule.weight;
-					growth_acc[dst_offset + x * H + y] += g;
-				}
-			}
-		}
-
-		// Apply accumulated growth to each layer
-		const count = W * H * this.layers;
-		for (let i = 0; i < count; i++) {
-			let val = this.world[i] + t * growth_acc[i];
-			if (val < 0) val = 0;
-			if (val > 1) val = 1;
-			this.next_world[i] = val;
-		}
-
-		// If mass conservation is enabled, redistribute clamping error
-		if (this.gui_sim_state.mass_conserved) {
-			let target_mass = 0;
-			for (let i = 0; i < count; i++) target_mass += this.world[i];
-
-			const MAX_ITERS = 10;
-			const TOLERANCE = 1e-6;
-
-			for (let iter = 0; iter < MAX_ITERS; iter++) {
-				let current_mass = 0;
-				for (let i = 0; i < count; i++) current_mass += this.next_world[i];
-
-				const error = current_mass - target_mass;
-				if (Math.abs(error) < TOLERANCE) break;
-
-				let eligible = 0;
-				for (let i = 0; i < count; i++) {
-					if (error > 0 && this.next_world[i] > 0) eligible++;
-					else if (error < 0 && this.next_world[i] < 1) eligible++;
-				}
-				if (eligible === 0) break;
-
-				const correction = error / eligible;
-				for (let i = 0; i < count; i++) {
-					if (error > 0 && this.next_world[i] > 0) {
-						this.next_world[i] -= correction;
-						if (this.next_world[i] < 0) this.next_world[i] = 0;
-					} else if (error < 0 && this.next_world[i] < 1) {
-						this.next_world[i] -= correction;
-						if (this.next_world[i] > 1) this.next_world[i] = 1;
-					}
-				}
-			}
-		}
-
-		this.world.set(this.next_world);
-	}
 
 	draw(){
-		if (this.wasm) {
-			this._draw_wasm();
-		} else {
-			this._draw_js();
-		}
+		if (!this.wasm) return;
+		this._draw_wasm();
 	}
 
 	_blit() {
@@ -1307,30 +1400,5 @@ class Lenia {
 		this._blit();
 	}
 
-	_draw_js() {
-		var image = this.offscreen_ctx.getImageData(0, 0, this.world_width, this.world_height);
-		
-		const setPixel = (x, y, r, g, b, a=255) => {
-			const i = (y * this.world_width + x) * 4;
-			image.data[i+0] = r;
-			image.data[i+1] = g;
-			image.data[i+2] = b;
-			image.data[i+3] = a;
-		}
-		
-		for(let x = 0; x < this.world_width; x++){
-			for(let y = 0; y < this.world_height; y++){
-				setPixel(x, y,
-					this.world.get(x,y,0) * 255,
-					this.world.get(x,y,1) * 255,
-					this.world.get(x,y,2) * 255
-				)
-			}
-		}
 
-		this.offscreen_ctx.putImageData(image, 0, 0)
-
-		// Scale offscreen onto visible canvas
-		this._blit();
-	}
 }

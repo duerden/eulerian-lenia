@@ -77,34 +77,28 @@ static void fft1d(double* data, int n, bool inverse) {
 // data: array of 2*W*H doubles, row-major, [re, im] interleaved
 // W, H: dimensions (must be powers of 2)
 // inverse: false = forward, true = inverse
-static void fft2d(double* data, int W, int H, bool inverse) {
-    // Temporary buffer for a single row/column
-    int max_dim = W > H ? W : H;
-    double* temp = new double[2 * max_dim];
-
+// col_buf: pre-allocated scratch buffer for column extraction,
+//          must hold at least 2 * max(W, H) doubles
+static void fft2d(double* data, int W, int H, bool inverse, double* col_buf) {
     // Transform rows
     for (int y = 0; y < H; y++) {
-        // Row y starts at data[2 * (y * W)]
-        // Rows are already contiguous, apply 1D FFT in-place
         fft1d(&data[2 * y * W], W, inverse);
     }
 
     // Transform columns
     for (int x = 0; x < W; x++) {
-        // Extract column x into temp
+        // Extract column x into col_buf
         for (int y = 0; y < H; y++) {
-            temp[2*y]     = data[2 * (y * W + x)];
-            temp[2*y + 1] = data[2 * (y * W + x) + 1];
+            col_buf[2*y]     = data[2 * (y * W + x)];
+            col_buf[2*y + 1] = data[2 * (y * W + x) + 1];
         }
-        fft1d(temp, H, inverse);
+        fft1d(col_buf, H, inverse);
         // Write back
         for (int y = 0; y < H; y++) {
-            data[2 * (y * W + x)]     = temp[2*y];
-            data[2 * (y * W + x) + 1] = temp[2*y + 1];
+            data[2 * (y * W + x)]     = col_buf[2*y];
+            data[2 * (y * W + x) + 1] = col_buf[2*y + 1];
         }
     }
-
-    delete[] temp;
 }
 
 extern "C" {
@@ -170,6 +164,7 @@ void apply_rule(
 // kernel_size:   diameter of the kernel (odd number)
 // kernel_fft:    output buffer, 2 * W * H doubles (pre-allocated)
 // W, H:          world dimensions (must be powers of 2)
+// col_buf:       scratch buffer, at least 2 * max(W, H) doubles
 // ---------------------------------------------------------------
 EMSCRIPTEN_KEEPALIVE
 void fft_prepare_kernel(
@@ -177,7 +172,8 @@ void fft_prepare_kernel(
     int kernel_size,
     double* kernel_fft,
     int W,
-    int H
+    int H,
+    double* col_buf
 ) {
     const int khalf = (kernel_size - 1) / 2;
     const int N = W * H;
@@ -202,73 +198,96 @@ void fft_prepare_kernel(
     }
 
     // Forward FFT
-    fft2d(kernel_fft, W, H, false);
+    fft2d(kernel_fft, W, H, false, col_buf);
+}
+
+// ---------------------------------------------------------------
+// fft_forward_layer()
+//
+// Copies a single world layer into a complex interleaved buffer
+// and applies a forward FFT.  The result can be reused by
+// multiple fft_apply_rule_cached() calls that share the same
+// source layer, avoiding redundant forward transforms.
+//
+// world:         flat Float64Array [layers * W * H]
+// source_layer:  layer index to transform
+// out_fft:       output buffer, 2 * W * H doubles (pre-allocated)
+// W, H:          world dimensions (must be powers of 2)
+// col_buf:       scratch for fft2d column pass, 2 * max(W,H)
+// ---------------------------------------------------------------
+EMSCRIPTEN_KEEPALIVE
+void fft_forward_layer(
+    double* world,
+    int source_layer,
+    double* out_fft,
+    int W,
+    int H,
+    double* col_buf
+) {
+    const int N = W * H;
+    const int src_offset = source_layer * W * H;
+
+    // Copy source layer into out_fft as complex data (row-major for FFT).
+    //    World layout: world[src_offset + x*H + y] (column-major per layer)
+    //    FFT layout: out_fft[2*(y*W + x)] (row-major)
+    memset(out_fft, 0, 2 * N * sizeof(double));
+    for (int x = 0; x < W; x++) {
+        for (int y = 0; y < H; y++) {
+            out_fft[2 * (y * W + x)] = world[src_offset + x * H + y];
+        }
+    }
+
+    fft2d(out_fft, W, H, false, col_buf);
 }
 
 // ---------------------------------------------------------------
 // fft_apply_rule()
 //
-// FFT-based convolution for a single kernel rule.
-// Convolves the source layer with a pre-FFT'd kernel, applies
-// the growth function, and accumulates into the dest layer of
-// growth_acc.
+// FFT-based convolution for a single kernel rule, using a
+// pre-computed forward FFT of the source layer (from
+// fft_forward_layer).
 //
-// world:         flat Float64Array [layers * W * H], layer-first,
-//                stored as world[layer][x][y] = world[layer*W*H + x*H + y]
+// source_fft:    forward FFT of source layer (2 * W * H, read-only)
 // growth_acc:    flat Float64Array [layers * W * H]
 // W, H:          world dimensions (must be powers of 2)
-// source_layer:  layer index to convolve
 // dest_layer:    layer index for growth output
 // kernel_fft:    pre-computed FFT of kernel (2 * W * H doubles)
 // temp:          scratch buffer (2 * W * H doubles, pre-allocated)
+// col_buf:       scratch for fft2d column pass, 2 * max(W,H)
 // mu, sigma:     growth function parameters
 // weight:        rule weight
 // ---------------------------------------------------------------
 EMSCRIPTEN_KEEPALIVE
 void fft_apply_rule(
-    double* world,
+    double* source_fft,
     double* growth_acc,
     int W,
     int H,
-    int source_layer,
     int dest_layer,
     double* kernel_fft,
     double* temp,
+    double* col_buf,
     double mu,
     double sigma,
     double weight
 ) {
     const int N = W * H;
-    const int src_offset = source_layer * W * H;
     const int dst_offset = dest_layer * W * H;
 
-    // 1. Copy source layer into temp as complex data (row-major for FFT).
-    //    World layout: world[src_offset + x*H + y] (column-major per layer)
-    //    FFT layout: temp[2*(y*W + x)] (row-major)
-    memset(temp, 0, 2 * N * sizeof(double));
-    for (int x = 0; x < W; x++) {
-        for (int y = 0; y < H; y++) {
-            temp[2 * (y * W + x)] = world[src_offset + x * H + y];
-        }
-    }
-
-    // 2. Forward FFT of source layer
-    fft2d(temp, W, H, false);
-
-    // 3. Pointwise complex multiplication: temp = temp * kernel_fft
+    // 1. Pointwise complex multiplication: temp = source_fft * kernel_fft
     for (int i = 0; i < N; i++) {
-        double ar = temp[2*i];
-        double ai = temp[2*i + 1];
+        double ar = source_fft[2*i];
+        double ai = source_fft[2*i + 1];
         double br = kernel_fft[2*i];
         double bi = kernel_fft[2*i + 1];
         temp[2*i]     = ar * br - ai * bi;
         temp[2*i + 1] = ar * bi + ai * br;
     }
 
-    // 4. Inverse FFT
-    fft2d(temp, W, H, true);
+    // 2. Inverse FFT
+    fft2d(temp, W, H, true, col_buf);
 
-    // 5. Apply growth function and accumulate into growth_acc.
+    // 3. Apply growth function and accumulate into growth_acc.
     //    Read back from row-major FFT layout to column-major world layout.
     const double inv_2ss = 1.0 / (2.0 * sigma * sigma);
     for (int x = 0; x < W; x++) {
@@ -387,8 +406,9 @@ void draw(
 ) {
     const int layer_size = W * H;
 
-    for (int x = 0; x < W; x++) {
-        for (int y = 0; y < H; y++) {
+    // Iterate y-outer, x-inner so rgba writes are sequential
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
             const int pixel_idx = (y * W + x) * 4;
             const int world_idx = x * H + y;
 
